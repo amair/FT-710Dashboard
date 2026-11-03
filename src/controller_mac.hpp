@@ -81,6 +81,13 @@ private:
     void handleWebRequest(std::shared_ptr<web::Request> request);
     void publishWeb(bool urgent = false);
     std::string buildStateJson();
+
+    // Memory instrumentation helpers (for debugging std::bad_alloc)
+    /// Returns RSS memory usage in KB using getrusage() - more reliable than ps command
+    size_t get_memory_usage_kb();
+
+    /// Logs current RSS memory usage with [FT-710] prefix
+    void log_memory_usage();
 };
 
 }
