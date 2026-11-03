@@ -328,7 +328,9 @@ void Server::websocket(Client& client, Stream& stream, std::string input, const 
     bool listening = false, audioScope = false, rfScope = false, alive = true; auto seen = GetTickCount64(), sentState = seen, sentSpectrum = seen, sentRfSpectrum = seen;
     unsigned commands = 0; auto commandPeriod = seen;
     std::string previousState;
-    frame(stream,1,"{\"type\":\"hello\",\"client\":" + std::to_string(client.id) + ",\"rate\":48000}");
+    if (!frame(stream,1,"{\"type\":\"hello\",\"client\":" + std::to_string(client.id) + ",\"rate\":48000}")) {
+        alive = false;
+    }
     while (alive && running_) {
         auto now = GetTickCount64();
         if (now - seen > 15000 || accessRevision != accessRevision_.load() || !authenticated("ft710_tls_session=" + token)) break;

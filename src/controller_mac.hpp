@@ -62,7 +62,7 @@ private:
     bool microphoneWanted_ = false;
     float receiveGain_ = 1.0f;
     float micGain_ = 1.0f;
-    std::string rfCat2Port_;
+    std::string rfCat2Port_ = "";
     unsigned rfSpan_ = 7;
     unsigned rfCat2Baud_ = 4800;
     double rfWaterfallLevelDb_ = -5.0;

@@ -38,9 +38,16 @@ brew install cmake hamlib portaudio openssl@3
 ```
 
 ### 2. Build
-From the repository root:
+
+By default, builds without debug output for optimal performance:
 ```bash
 cmake -B build-mac -S .
+cmake --build build-mac
+```
+
+**Debug mode**: For detailed debug output (JSON construction, memory usage, etc.), enable `BUILD_DEBUG`:
+```bash
+cmake -B build-mac -S . -DBUILD_DEBUG=ON
 cmake --build build-mac
 ```
 
