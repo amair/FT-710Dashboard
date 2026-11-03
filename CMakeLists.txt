@@ -3,6 +3,11 @@ project(FT710Dashboard VERSION 2.0.5 LANGUAGES C CXX)
 include(CTest)
 
 set(CMAKE_CXX_STANDARD 20)
+
+option(BUILD_DEBUG "Enable debug logging output (e.g., RSS memory, JSON build progress)" OFF)
+if(BUILD_DEBUG)
+  add_definitions(-DBUILD_DEBUG)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(APPLE)

@@ -27,7 +27,7 @@ private:
     Handler handler_;
     Log log_;
     socket_t listener_ = INVALID_SOCKET;
-    bool winsock_ = false;
+    [[maybe_unused]] bool winsock_ = false;  // Used for Windows-specific cleanup in stop()
     std::atomic<bool> running_{false};
     std::atomic<unsigned> clients_{0};
     unsigned port_ = 0;
