@@ -38,9 +38,16 @@ brew install cmake hamlib portaudio openssl@3
 ```
 
 ### 2. Compilar
-Desde la raíz del repositorio:
+
+Por defecto, se compila sin mensajes de depuración para rendimiento óptimo:
 ```bash
 cmake -B build-mac -S .
+cmake --build build-mac
+```
+
+**Modo depuración**: Para ver mensajes detallados de construcción JSON, uso de memoria, etc., habilite `BUILD_DEBUG`:
+```bash
+cmake -B build-mac -S . -DBUILD_DEBUG=ON
 cmake --build build-mac
 ```
 

@@ -1,17 +1,17 @@
 # FT-710 Dashboard for macOS · Yaesu FT-710 Remote Control
-**Ported & Developed for macOS by**: Yury Jajitzky (**YY3BIG**)  
-**Based on**: [FT-710 Dashboard for Windows by M0NXD](https://github.com/M0NXD/FT-710Dashboard)  
+**Ported & Developed for macOS by**: Yury Jajitzky (**YY3BIG**)
+**Based on**: [FT-710 Dashboard for Windows by M0NXD](https://github.com/M0NXD/FT-710Dashboard)
 **License**: [Apache License 2.0](LICENSE) (See [NOTICE](NOTICE) and [DISCLAIMER.md](DISCLAIMER.md))
 
 ---
 
-**Languages / Idiomas / Langues / Línguas / Lingue**:  
+**Languages / Idiomas / Langues / Línguas / Lingue**:
 [English](README_EN.md) | [Español](README_ES.md) | [Français](README_FR.md) | [Português](README_PT.md) | [Italiano](README_IT.md)
 
 ---
 
 > [!CAUTION]
-> **EXPERIMENTAL AMATEUR RADIO SOFTWARE NOTICE**  
+> **EXPERIMENTAL AMATEUR RADIO SOFTWARE NOTICE**
 > This software is strictly experimental and distributed under the principles of the Amateur Radio Service. The **Control Operator** is at all times solely and exclusively responsible for the technical operation, RF output power, frequency band limits, Standing Wave Ratio (SWR), and PTT keying of their station. For initial tests, always use a **50 Ω Dummy Load**. Read the full legal terms in [DISCLAIMER.md](DISCLAIMER.md).
 
 ---
@@ -38,9 +38,16 @@ brew install cmake hamlib portaudio openssl@3
 ```
 
 ### 2. Build
-From the repository root:
+
+By default, builds without debug output for optimal performance:
 ```bash
 cmake -B build-mac -S .
+cmake --build build-mac
+```
+
+**Debug mode**: For detailed debug output (JSON construction, memory usage, etc.), enable `BUILD_DEBUG`:
+```bash
+cmake -B build-mac -S . -DBUILD_DEBUG=ON
 cmake --build build-mac
 ```
 
@@ -81,17 +88,28 @@ The application will automatically detect the serial port. To specify a port or 
 
 ## Web Access & Phone Audio on iPhone / iPad
 
-1. Upon starting the server, open in Safari: `http://localhost:8888/setup` (or replace `localhost` with your Mac's local IP address).
-2. Download the configuration profile and install it in iOS (**Settings &rarr; Profile Downloaded &rarr; Install**).
-3. Enable certificate trust in iOS (**Settings &rarr; General &rarr; About &rarr; Certificate Trust Settings &rarr; Enable full trust for M0NXD / YY3BIG**).
-4. Navigate to `https://<your-mac-ip>:8888/` for full remote control and bidirectional audio from your phone.
+  1. Upon starting the server, open in Safari: `http://localhost:8888/setup` (or
+  replace `localhost` with your Mac's local IP address).
+  2. Download the configuration profile and install it in iOS (**Settings &rarr;
+  Profile Downloaded &rarr; Install**).
+  3. Enable certificate trust in iOS (**Settings &rarr; General &rarr; About
+  &rarr; Certificate Trust Settings &rarr; Enable full trust for M0NXD /
+  YY3BIG**).
+  4. Navigate to `https://<your-mac-ip>:8888/` for full remote control and
+  bidirectional audio from your phone.
 
+  **macOS Users (Desktop Browser):**
+  If you see a "Certificate Authority Invalid" error in your browser:
+  1. Open **Keychain Access**.
+  2. Search for `M0NXD FT710 Local Web Root`.
+  3. Double-click the certificate, expand **Trust**, and set **When using this
+  certificate** to **Always Trust**.
 ---
 
 ## License & Attribution
 
 This project is distributed under the **Apache License 2.0**.
 Pursuant to Section 4(d) of the license:
-* Any redistribution, fork, modification, or derivative work **MUST retain the `NOTICE` file** and provide prominent attribution to:  
+* Any redistribution, fork, modification, or derivative work **MUST retain the `NOTICE` file** and provide prominent attribution to:
   **"Yury Jajitzky (YY3BIG) - FT-710 Dashboard for macOS"**
 * Original Windows project developed by **M0NXD** (https://github.com/M0NXD/FT-710Dashboard).

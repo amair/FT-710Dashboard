@@ -13,6 +13,7 @@
 #include <set>
 #include <map>
 #include <chrono>
+#include <array>
 
 namespace app {
 
@@ -36,6 +37,10 @@ private:
     std::string webAccessCode_;
     radio::Snapshot state_;
     std::mutex stateMutex_;
+    // Web commands arrive on per-client WebSocket threads; serialize them so
+    // audio maps/routes, PTT ownership, sharing and connection settings are
+    // never read or written concurrently.
+    std::mutex commandMutex_;
 
     // Station connection settings
     int connectionKind_ = 0; // 0: USB CAT, 1: rigctld, 2: Dummy
@@ -62,7 +67,9 @@ private:
     bool microphoneWanted_ = false;
     float receiveGain_ = 1.0f;
     float micGain_ = 1.0f;
-    std::string rfCat2Port_;
+    std::array<std::wstring, 4> audioSelectedIds_{};  // per-slot device id ("", "pa:N", "browser:playback", "browser:capture")
+    bool unattended_ = false;
+    std::string rfCat2Port_ = "";
     unsigned rfSpan_ = 7;
     unsigned rfCat2Baud_ = 4800;
     double rfWaterfallLevelDb_ = -5.0;
@@ -81,6 +88,21 @@ private:
     void handleWebRequest(std::shared_ptr<web::Request> request);
     void publishWeb(bool urgent = false);
     std::string buildStateJson();
+
+    // Resolve the PortAudio endpoint for each route slot. Empty string means
+    // "system default device"; L"null" means "endpoint owned elsewhere
+    // (browser), open no host device".
+    std::wstring receiveSource() const;
+    std::wstring receiveDest() const;
+    std::wstring micSource() const;
+    std::wstring micDest() const;
+
+    // Memory instrumentation helpers (for debugging std::bad_alloc)
+    /// Returns RSS memory usage in KB using getrusage() - more reliable than ps command
+    size_t get_memory_usage_kb();
+
+    /// Logs current RSS memory usage with [FT-710] prefix
+    void log_memory_usage();
 };
 
 }

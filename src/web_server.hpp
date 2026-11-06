@@ -46,7 +46,9 @@ private:
     Handler handler_;
     Log log_;
     socket_t listener_ = INVALID_SOCKET;
-    bool winsock_ = false;
+#if defined(_WIN32)
+    bool winsock_ = false;  // WSAStartup completed; stop() calls WSACleanup
+#endif
     std::atomic<bool> running_{false};
     std::atomic<unsigned> clients_{0};
     std::atomic<std::uint64_t> accessRevision_{0};

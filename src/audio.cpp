@@ -65,9 +65,9 @@ std::wstring savedDeviceName(const std::wstring& identity, bool input) {
     GUID guid{};
     if (FAILED(CLSIDFromString(guidText.c_str(), &guid))) return {};
     wchar_t canonical[40]{}; StringFromGUID2(guid, canonical, 40);
-    std::wstring key = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\";
-    key += input ? L"Capture\\" : L"Render\\";
-    key += canonical; key += L"\\Properties";
+    std::wstring key = L"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\";
+    key += input ? L"Capture\" : L"Render\";
+    key += canonical; key += L"\Properties";
     wchar_t name[1024]{}; DWORD bytes = sizeof(name);
     if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"{a45c254e-df1c-4efd-8020-67d146a850e0},14", RRF_RT_REG_SZ, nullptr, name, &bytes) == ERROR_SUCCESS)
         return name;
@@ -118,21 +118,25 @@ std::vector<Device> devices() {
     return result;
 }
 
-Route::Route() { stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
+Route::Route() {
+    stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+}
 Route::~Route() { stop(); if (stopEvent_) CloseHandle(stopEvent_); }
 Status Route::status() const { std::lock_guard lock(mutex_); return status_; }
 void Route::gate(bool enabled) {
     if (gate_.exchange(enabled) != enabled) { ++gateEpoch_; spectrum_.discontinuity(); if (receiveTap_) browserAudio().discontinuity(); }
 }
 void Route::gain(float value) { gain_ = std::clamp(value, 0.0f, 1.0f); }
-void Route::stop() {
+void Route::stop() { std::lock_guard lock(startStopMutex_); stopLocked(); }
+void Route::stopLocked() {
     requestStop();
     if (thread_.joinable()) thread_.join();
     std::lock_guard lock(mutex_); status_ = {};
 }
 void Route::requestStop() { gate(false); if (stopEvent_) SetEvent(stopEvent_); }
 void Route::start(const std::wstring& source, const std::wstring& destination) {
-    stop();
+    std::lock_guard lock(startStopMutex_);
+    stopLocked();
     if (!stopEvent_) throw std::runtime_error("Cannot create the audio stop event.");
     if (source.empty() || destination.empty()) throw std::invalid_argument("Select both audio devices first.");
     ResetEvent(stopEvent_);
@@ -184,6 +188,7 @@ void Route::run(std::wstring source, std::wstring destination) {
         DWORD task = 0; scheduler = AvSetMmThreadCharacteristicsW(L"Audio", &task);
         { std::lock_guard lock(mutex_); status_.active = true; status_.starting = false; status_.text = L"Running"; }
         std::deque<float> frames;
+
         bool buffering = true;
         unsigned epoch = gateEpoch_;
         float sourcePeak = 0, destinationPeak = 0;
@@ -213,7 +218,14 @@ void Route::run(std::wstring source, std::wstring destination) {
                     float sample = captureFlags & AUDCLNT_BUFFERFLAGS_SILENT ? 0 : (samples[i * 2] + samples[i * 2 + 1]) * .5f;
                     if (!std::isfinite(sample)) sample = 0;
                     sourcePeak = std::max(sourcePeak, std::abs(sample));
-                    if (enabled) { frames.push_back(sample); spectrum_.push(sample); if (receiveTap_) browserAudio().receive(sample * gain_.load()); }
+                    if (enabled) {
+                        frames.push_back(sample);
+                        spectrum_.push(sample);
+                        if (receiveTap_) browserAudio().receive(sample * gain_.load());
+
+                        std::lock_guard tap_lock(taps_mutex_);
+                        for (auto& tap : taps_) tap->push_sample(sample);
+                    }
                 }
                 check(capture->ReleaseBuffer(count), L"Release capture buffer");
                 check(capture->GetNextPacketSize(&packet), L"Read next capture packet");
@@ -256,4 +268,5 @@ void Route::run(std::wstring source, std::wstring destination) {
     if (scheduler) AvRevertMmThreadCharacteristics(scheduler);
     std::lock_guard lock(mutex_); status_.active = status_.starting = false; status_.inputPeak = status_.outputPeak = 0;
 }
+
 }

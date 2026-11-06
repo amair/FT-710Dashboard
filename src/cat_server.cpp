@@ -75,7 +75,7 @@ std::string response(const radio::CatRequest& request, const radio::CatReply& re
 }
 }
 
-CatServer::CatServer(Handler handler, Log log) : handler_(std::move(handler)), log_(std::move(log)) {}
+CatServer::CatServer(Handler handler, Log log, TapFactory tapFactory, TapRemover tapRemover) : handler_(std::move(handler)), log_(std::move(log)), tapFactory_(std::move(tapFactory)), tapRemover_(std::move(tapRemover)) {}
 CatServer::~CatServer() { stop(); }
 void CatServer::start(unsigned port, std::uint64_t generation) {
     stop();
@@ -175,9 +175,11 @@ void CatServer::serve(Client& client) {
     while (running_ && connected) {
         char data[1024];
         int n = recv(client.socket, data, sizeof data, 0);
-        if (n == SOCKET_ERROR && is_socket_timeout(socket_error_code())) continue;
-        if (n <= 0) break;
-        buffer.append(data, n);
+        bool timeout = (n == SOCKET_ERROR && is_socket_timeout(socket_error_code()));
+        if (!timeout) {
+            if (n <= 0) break;
+            buffer.append(data, n);
+        }
         while (connected && running_) {
             auto end = buffer.find('\n');
             if (end == std::string::npos) break;
@@ -209,6 +211,15 @@ void CatServer::serve(Client& client) {
             } else if (request.name == "set_vfo_opt") {
                 if (request.arguments.size() != 1 || (request.arguments[0] != "0" && request.arguments[0] != "1")) reply.result = -1;
                 else vfoMode = request.arguments[0] == "1";
+            } else if (request.name == "stream_audio") {
+                std::lock_guard lock(mutex_);
+                if (streaming_clients_.find(client.id) == streaming_clients_.end()) {
+                    streaming_clients_[client.id] = tapFactory_();
+                    client.is_streaming = true;
+                    set_socket_timeout(client.socket, SO_RCVTIMEO, 20);
+                    log_("Client " + std::to_string(client.id) + " started audio streaming.");
+                }
+                reply.result = 0;
             } else {
                 if (vfoMode && hasVfo(request.name)) {
                     if (request.arguments.empty()) reply.result = -1;
@@ -234,6 +245,28 @@ void CatServer::serve(Client& client) {
             }
             if (!sendAll(client.socket, response(request, reply, extended, separator, vfoMode))) connected = false;
         }
+
+        // Stream audio on every outer-loop iteration (polling interval = recv timeout).
+        if (connected && client.is_streaming) {
+            audio::AudioTap* tap = nullptr;
+            {
+                std::lock_guard lock(mutex_);
+                auto it = streaming_clients_.find(client.id);
+                if (it != streaming_clients_.end()) tap = it->second;
+            }
+            if (tap) {
+                auto samples = tap->pull_samples(960);
+                if (!samples.empty()) {
+                    uint32_t count = static_cast<uint32_t>(samples.size());
+                    std::string packet;
+                    packet.reserve(sizeof(count) + samples.size() * sizeof(float));
+                    packet.append(reinterpret_cast<const char*>(&count), sizeof(count));
+                    packet.append(reinterpret_cast<const char*>(samples.data()), samples.size() * sizeof(float));
+                    if (!sendAll(client.socket, packet)) connected = false;
+                }
+            }
+        }
+
         if (buffer.size() > 4096) { sendAll(client.socket, "RPRT -8\n"); break; }
     }
     // The worker releases CAT PTT only when this client still owns it.
@@ -243,6 +276,11 @@ void CatServer::serve(Client& client) {
     {
         std::lock_guard lock(mutex_);
         closesocket(client.socket); client.socket = INVALID_SOCKET;
+        auto it = streaming_clients_.find(client.id);
+        if (it != streaming_clients_.end()) {
+            if (tapRemover_) tapRemover_(it->second);
+            streaming_clients_.erase(it);
+        }
     }
     --clients_;
     log_("CAT client " + std::to_string(client.id) + " disconnected.");

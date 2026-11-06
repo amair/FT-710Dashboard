@@ -1,6 +1,14 @@
 /build/
 /build-mac/
-/dist/
+/build-mac-debug/
+/build-mac-release/
+
+# Claude Code local environment (per-developer, not part of the project)
+.claude/
+
+# Python bytecode
+__pycache__/
+macos-yy3big/
 /vendor/
 *.user
 *.log
@@ -18,3 +26,9 @@
 
 # FTDI runtime binaries are downloaded separately and must not be committed
 /runtime/ftdi/*.dll
+
+# MacOS
+.DS_Store
+
+# Build 
+.vscode
