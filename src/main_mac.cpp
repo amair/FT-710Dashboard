@@ -100,6 +100,11 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
+    // Writing to a socket whose peer has gone away (browser tab closed,
+    // page refresh, CAT client dropped) must not kill the station dashboard.
+    // Ignoring SIGPIPE makes the send fail with EPIPE instead, which the web
+    // and CAT servers already treat as a client disconnect.
+    std::signal(SIGPIPE, SIG_IGN);
 
     try {
         app::ControllerMac controller;

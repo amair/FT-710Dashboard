@@ -28,6 +28,7 @@ double number(const std::string& value, double minimum, double maximum, bool int
         throw std::invalid_argument("Value is outside the allowed range");
     return result;
 }
+std::wstring toWide(const std::string& utf8) { return std::wstring(utf8.begin(), utf8.end()); }
 }
 
 ControllerMac::ControllerMac() = default;
@@ -37,7 +38,9 @@ ControllerMac::~ControllerMac() {
 }
 
 void ControllerMac::log(const std::string& message) {
+#ifdef BUILD_DEBUG
     std::cout << "[FT-710] " << message << std::endl;
+#endif
     {
         std::lock_guard lock(activityMutex_);
         // Safety bounds to prevent bad_alloc during logging itself
@@ -92,8 +95,10 @@ size_t ControllerMac::get_memory_usage_kb() {
 }
 
 void ControllerMac::log_memory_usage() {
+#ifdef BUILD_DEBUG
     size_t mem = get_memory_usage_kb();
     std::cout << "[FT-710] [MEMORY] RSS: " << mem << " KB" << std::endl;
+#endif
 }
 
 // JSON building size constant for buildStateJson (changed from 4MB to 16MB)
@@ -127,14 +132,16 @@ void ControllerMac::initialize(bool demo, const std::string& serialPort, int bau
     std::filesystem::path certDir = home ? (std::filesystem::path(home) / ".config" / "ft710") : ".";
     std::wstring certDirW = certDir.wstring();
 
+#ifdef BUILD_DEBUG
     std::cout << "[FT-710] [INIT] Phase 2: Starting web server with TLS certificate loading..." << std::endl;
-    size_t memBefore = get_memory_usage_kb();
-    std::cout << "[FT-710] [MEMORY] Before TLS init: " << memBefore << " KB" << std::endl;
-
+    std::cout << "[FT-710] [MEMORY] Before TLS init: " << get_memory_usage_kb() << " KB" << std::endl;
+#endif
+    // The web dashboard is a core feature: it must start in release builds
+    // too (only the diagnostics above are debug-only).
     webServer_->start(certDirW, webAccessCode_);
-
-    size_t memAfter = get_memory_usage_kb();
-    std::cout << "[FT-710] [INIT] Web server started successfully. Memory after TLS: " << memAfter << " KB" << std::endl;
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710] [INIT] Web server started successfully. Memory after TLS: " << get_memory_usage_kb() << " KB" << std::endl;
+#endif
 
     connectRadio();
     if (sharingWanted_) startSharing();
@@ -164,7 +171,9 @@ void ControllerMac::startSharing() {
             [this](std::shared_ptr<radio::CatJob> job) {
                 return worker_->request(job);
             },
-            [this](const std::string& msg) { log(msg); }
+            [this](const std::string& msg) { log(msg); },
+            [this]() -> audio::AudioTap* { return receiveAudio_.add_tap(); },
+            [this](audio::AudioTap* tap) { receiveAudio_.remove_tap(tap); }
         );
     }
     try {
@@ -177,7 +186,10 @@ void ControllerMac::startSharing() {
 }
 
 void ControllerMac::stopSharing() {
-    if (catServer_) catServer_->stop();
+    if (catServer_) {
+        catServer_->stop();
+        catServer_.reset();
+    }
 }
 
 void ControllerMac::releasePtt() {
@@ -189,6 +201,25 @@ void ControllerMac::releasePtt() {
     browserPttOwner_ = 0;
     pttPending_ = false;
     microphoneAudio_.gate(false);
+}
+
+std::wstring ControllerMac::receiveSource() const {
+    if (!audioSelectedIds_[0].empty()) return audioSelectedIds_[0];
+    // No explicit choice: use the radio's USB Audio CODEC, else the default input.
+    return audio::findFT710AudioDevice(audio::devices(), true);
+}
+std::wstring ControllerMac::receiveDest() const {
+    // Empty => system default output; "browser:playback" => no host output.
+    return audioSelectedIds_[1];
+}
+std::wstring ControllerMac::micSource() const {
+    // Empty => system default input; "browser:capture" => no host input.
+    return audioSelectedIds_[2];
+}
+std::wstring ControllerMac::micDest() const {
+    if (!audioSelectedIds_[3].empty()) return audioSelectedIds_[3];
+    // No explicit choice: route transmit audio into the radio's USB Audio CODEC.
+    return audio::findFT710AudioDevice(audio::devices(), false);
 }
 
 void ControllerMac::onRadioUpdate(const radio::Snapshot& newState) {
@@ -209,6 +240,10 @@ void ControllerMac::onRadioUpdate(const radio::Snapshot& newState) {
 }
 
 void ControllerMac::handleWebRequest(std::shared_ptr<web::Request> request) {
+    // Commands arrive on per-client WebSocket threads; serialize them so the
+    // audio routes and shared settings below cannot race (e.g. two clients
+    // starting/stopping the same route, or a map write during a route start).
+    std::lock_guard<std::mutex> commandLock(commandMutex_);
     try {
         const auto& f = request->fields;
         auto get = [&](const char* k) { auto it = f.find(k); return it != f.end() ? it->second : ""; };
@@ -261,18 +296,35 @@ void ControllerMac::handleWebRequest(std::shared_ptr<web::Request> request) {
             sharePort_ = static_cast<unsigned>(number(get("port"), 1, 65535, true));
             if (sharingWanted_) startSharing();
             else stopSharing();
+        } else if (action == "audioMap") {
+            // Persist the device chosen for a route slot (0 receive source,
+            // 1 receive dest, 2 mic source, 3 mic dest) and restart the route
+            // if it is currently active.
+            unsigned slot = static_cast<unsigned>(number(get("slot"), 0, 3, true));
+            std::wstring id = toWide(get("device"));
+            if (!id.empty() && !id.starts_with(L"browser:")) {
+                bool found = false;
+                for (const auto& d : audio::devices()) if (d.id == id) { found = true; break; }
+                if (!found) throw std::runtime_error("Audio device is unavailable");
+            }
+            if (audioSelectedIds_[slot] != id) {
+                audioSelectedIds_[slot] = id;
+                log("Audio mapping " + std::to_string(slot) + " set to '" + get("device") + "'");
+                if (slot <= 1) { if (receiveWanted_) receiveAudio_.start(receiveSource(), receiveDest()); }
+                else if (microphoneWanted_) microphoneAudio_.start(micSource(), micDest());
+            }
         } else if (action == "audioRoute") {
             bool isMic = get("route") == "microphone";
             bool en = get("enabled") == "1";
             if (isMic) {
                 microphoneWanted_ = en;
-                if (en) microphoneAudio_.start(L"", L"");
+                if (en) microphoneAudio_.start(micSource(), micDest());
                 else microphoneAudio_.stop();
             } else {
                 receiveWanted_ = en;
                 if (en) {
                     receiveAudio_.receivedAudio(true);
-                    receiveAudio_.start(L"", L"");
+                    receiveAudio_.start(receiveSource(), receiveDest());
                 } else {
                     receiveAudio_.stop();
                 }
@@ -282,6 +334,12 @@ void ControllerMac::handleWebRequest(std::shared_ptr<web::Request> request) {
             float val = std::stof(get("value")) / 100.0f;
             if (isMic) { micGain_ = val; microphoneAudio_.gain(val); }
             else { receiveGain_ = val; receiveAudio_.gain(val); }
+        } else if (action == "pttLimit") {
+            static const int limits[] = {30, 60, 180, 300, 600};
+            int index = static_cast<int>(number(get("index"), 0, 4, true));
+            pttLimitSeconds_ = limits[index];
+        } else if (action == "unattended") {
+            unattended_ = get("enabled") == "1";
         } else if (action == "frequency") {
             cmd.action = radio::Action::Frequency;
             cmd.number = number(get("hz"), 30000, 60000000);
@@ -362,16 +420,22 @@ void ControllerMac::publishWeb(bool urgent) {
             webServer_->rfSpectrum(rfFrame, rfFrame.centerHz, rf_scope::spanHz(rfFrame.spanIndex));
         }
     } catch (const std::bad_alloc& e) {
+#ifdef BUILD_DEBUG
         size_t rssAtCrash = get_memory_usage_kb();
         std::cout << "[FT-710] [PUBWEB] CRITICAL: Memory allocation failed at RSS=" << rssAtCrash << " KB" << std::endl;
+#endif
         throw;
     } catch (const std::exception& e) {
+#ifdef BUILD_DEBUG
         size_t rssAtCrash = get_memory_usage_kb();
         std::cout << "[FT-710] [PUBWEB] CRITICAL: exception at RSS=" << rssAtCrash << " KB: " << e.what() << std::endl;
+#endif
         throw;
     } catch (...) {
+#ifdef BUILD_DEBUG
         size_t rssAtCrash = get_memory_usage_kb();
         std::cout << "[FT-710] [PUBWEB] CRITICAL: unknown exception at RSS=" << rssAtCrash << " KB" << std::endl;
+#endif
         throw;
     }
 }
@@ -387,33 +451,35 @@ std::string ControllerMac::buildStateJson() {
     std::lock_guard lock(stateMutex_);
     const auto& s = state_;
 
-    // Log RSS at start of construction
+    // Log RSS at start of construction (debug output only)
+#ifdef BUILD_DEBUG
     std::cout << "[FT-710] [BUILD] Starting JSON construction..." << std::endl;
     std::cout << "[FT-710] [BUILD] RSS memory: " << get_memory_usage_kb() << " KB" << std::endl;
+#endif
 
     std::string result = "{\"type\":\"state\",\"generation\":" + std::to_string(s.generation);
-    result += "\",\"online\":" + boolean(s.online);
-    result += "\",\"portOpen\":" + boolean(s.portOpen);
-    result += "\",\"busy\":" + boolean(s.busy);
-    result += "\",\"demo\":" + boolean(s.demo);
-    result += "\",\"poweredOff\":" + boolean(s.poweredOff);
-    result += "\",\"standby\":" + boolean(s.standby);
-    result += "\",\"powerKnown\":" + boolean(s.powerKnown);
-    result += "\",\"canPower\":" + boolean(s.canPower);
-    result += "\",\"canPtt\":" + boolean(s.canPtt);
-    result += "\",\"pttKnown\":" + boolean(s.pttKnown);
-    result += "\",\"transmitting\":" + boolean(s.transmitting);
-    result += "\",\"dashboardPtt\":" + boolean(s.dashboardPtt);
-    result += "\",\"pttPending\":" + boolean(pttPending_);
-    result += "\",\"releasePending\":" + boolean(s.releasePending);
-    result += "\",\"browserOwner\":" + std::to_string(browserPttOwner_);
-    result += "\",\"micLease\":" + std::to_string(audio::browserAudio().lease());
-    result += "\",\"status\":" + web::json(s.connectionStatus);
-    result += "\",\"error\":" + web::json(s.error);
-    result += "\",\"activeVfo\":" + web::json(s.activeVfo == RIG_VFO_B ? "B" : "A");
-    result += "\",\"settingsVfo\":" + web::json(s.settingsVfo == RIG_VFO_A ? "A" : s.settingsVfo == RIG_VFO_B ? "B" : "Current");
-    result += "\",\"modes\":" + array(s.modes);
-    result += "\",\"vfos\":[";
+    result += ",\"online\":" + boolean(s.online);
+    result += ",\"portOpen\":" + boolean(s.portOpen);
+    result += ",\"busy\":" + boolean(s.busy);
+    result += ",\"demo\":" + boolean(s.demo);
+    result += ",\"poweredOff\":" + boolean(s.poweredOff);
+    result += ",\"standby\":" + boolean(s.standby);
+    result += ",\"powerKnown\":" + boolean(s.powerKnown);
+    result += ",\"canPower\":" + boolean(s.canPower);
+    result += ",\"canPtt\":" + boolean(s.canPtt);
+    result += ",\"pttKnown\":" + boolean(s.pttKnown);
+    result += ",\"transmitting\":" + boolean(s.transmitting);
+    result += ",\"dashboardPtt\":" + boolean(s.dashboardPtt);
+    result += ",\"pttPending\":" + boolean(pttPending_);
+    result += ",\"releasePending\":" + boolean(s.releasePending);
+    result += ",\"browserOwner\":" + std::to_string(browserPttOwner_);
+    result += ",\"micLease\":" + std::to_string(audio::browserAudio().lease());
+    result += ",\"status\":" + web::json(s.connectionStatus);
+    result += ",\"error\":" + web::json(s.error);
+    result += ",\"activeVfo\":" + web::json(s.activeVfo == RIG_VFO_B ? "B" : "A");
+    result += ",\"settingsVfo\":" + web::json(s.settingsVfo == RIG_VFO_A ? "A" : s.settingsVfo == RIG_VFO_B ? "B" : "Current");
+    result += ",\"modes\":" + array(s.modes);
+    result += ",\"vfos\":[";
 
     if (result.size() > MAX_JSON_STRING_SIZE) {
         throw std::runtime_error("buildStateJson: Exceeded maximum JSON size at VFO start");
@@ -423,15 +489,15 @@ std::string ControllerMac::buildStateJson() {
         const auto& vfo = i ? s.b : s.a;
         if (i) result += ',';
         result += "{\"frequency\":" + radio::formatNumber(std::isfinite(vfo.frequency) ? vfo.frequency : 0);
-        result += "\",\"frequencyValid\":" + boolean(vfo.frequencyValid);
-        result += "\",\"mode\":" + web::json(vfo.mode);
-        result += "\",\"modeValid\":" + boolean(vfo.modeValid);
-        result += "\",\"width\":" + std::to_string(vfo.width);
-        result += "\",\"frequencyRevision\":" + std::to_string(s.frequencyRevision[i]);
-        result += "\",\"modeRevision\":" + std::to_string(s.modeRevision[i]) + '}';
+        result += ",\"frequencyValid\":" + boolean(vfo.frequencyValid);
+        result += ",\"mode\":" + web::json(vfo.mode);
+        result += ",\"modeValid\":" + boolean(vfo.modeValid);
+        result += ",\"width\":" + std::to_string(vfo.width);
+        result += ",\"frequencyRevision\":" + std::to_string(s.frequencyRevision[i]);
+        result += ",\"modeRevision\":" + std::to_string(s.modeRevision[i]) + '}';
     }
     result += "],\"vfoRevision\":" + std::to_string(s.vfoRevision);
-    result += "\",\"settings\":[";
+    result += ",\"settings\":[";
 
     auto now = std::chrono::steady_clock::now();
     for (unsigned i = 0; i < s.settings.size(); ++i) {
@@ -443,26 +509,26 @@ std::string ControllerMac::buildStateJson() {
                            setting.type == radio::ValueType::Text ? "text" :
                            setting.type == radio::ValueType::Real ? "real" : "integer";
         result += "{\"id\":" + web::json(setting.id);
-        result += "\",\"name\":" + web::json(setting.name);
-        result += "\",\"group\":" + web::json(setting.group);
-        result += "\",\"description\":" + web::json(setting.description);
-        result += "\",\"units\":" + web::json(setting.units);
-        result += "\",\"type\":" + web::json(type);
-        result += "\",\"readable\":" + boolean(setting.readable);
-        result += "\",\"writable\":" + boolean(setting.writable);
-        result += "\",\"valid\":" + boolean(setting.valid);
-        result += "\",\"txOnly\":" + boolean(setting.txOnly);
-        result += "\",\"bounded\":" + boolean(setting.bounded);
-        result += "\",\"minimum\":" + radio::formatNumber(std::isfinite(setting.minimum) ? setting.minimum : 0);
-        result += "\",\"maximum\":" + radio::formatNumber(std::isfinite(setting.maximum) ? setting.maximum : 0);
-        result += "\",\"step\":" + radio::formatNumber(std::isfinite(setting.step) ? setting.step : 0);
-        result += "\",\"choices\":" + array(setting.choices);
-        result += "\",\"choiceValues\":" + array(setting.choiceValues);
-        result += "\",\"value\":" + web::json(setting.value);
-        result += "\",\"display\":" + web::json(radio::displayValue(setting));
-        result += "\",\"range\":" + web::json(radio::rangeText(setting));
-        result += "\",\"status\":" + web::json(setting.status);
-        result += "\",\"age\":" + std::to_string(age) + '}';
+        result += ",\"name\":" + web::json(setting.name);
+        result += ",\"group\":" + web::json(setting.group);
+        result += ",\"description\":" + web::json(setting.description);
+        result += ",\"units\":" + web::json(setting.units);
+        result += ",\"type\":" + web::json(type);
+        result += ",\"readable\":" + boolean(setting.readable);
+        result += ",\"writable\":" + boolean(setting.writable);
+        result += ",\"valid\":" + boolean(setting.valid);
+        result += ",\"txOnly\":" + boolean(setting.txOnly);
+        result += ",\"bounded\":" + boolean(setting.bounded);
+        result += ",\"minimum\":" + radio::formatNumber(std::isfinite(setting.minimum) ? setting.minimum : 0);
+        result += ",\"maximum\":" + radio::formatNumber(std::isfinite(setting.maximum) ? setting.maximum : 0);
+        result += ",\"step\":" + radio::formatNumber(std::isfinite(setting.step) ? setting.step : 0);
+        result += ",\"choices\":" + array(setting.choices);
+        result += ",\"choiceValues\":" + array(setting.choiceValues);
+        result += ",\"value\":" + web::json(setting.value);
+        result += ",\"display\":" + web::json(radio::displayValue(setting));
+        result += ",\"range\":" + web::json(radio::rangeText(setting));
+        result += ",\"status\":" + web::json(setting.status);
+        result += ",\"age\":" + std::to_string(age) + '}';
 
         // Size checkpoint every 50 settings (at ~20% through Hamlib settings)
         if ((i + 1) % 50 == 0 && result.size() > MAX_JSON_STRING_SIZE) {
@@ -470,16 +536,16 @@ std::string ControllerMac::buildStateJson() {
         }
     }
     result += "],\"connection\":{\"kind\":" + std::to_string(connectionKind_);
-    result += "\",\"endpoint\":" + web::json(endpoint_);
-    result += "\",\"baud\":" + web::json(std::to_string(baud_));
-    result += "\",\"stopBits\":" + web::json(std::to_string(stopBits_));
-    result += "\",\"flow\":" + web::json(flow_);
-    result += "\",\"poll\":" + web::json(std::to_string(pollMs_));
+    result += ",\"endpoint\":" + web::json(endpoint_);
+    result += ",\"baud\":" + web::json(std::to_string(baud_));
+    result += ",\"stopBits\":" + web::json(std::to_string(stopBits_));
+    result += ",\"flow\":" + web::json(flow_);
+    result += ",\"poll\":" + web::json(std::to_string(pollMs_));
     result += "},\"sharing\":{\"wanted\":" + boolean(sharingWanted_);
-    result += "\",\"running\":" + boolean(catServer_ && catServer_->running());
-    result += "\",\"port\":" + web::json(std::to_string(sharePort_));
-    result += "\",\"clients\":" + std::to_string(catServer_ ? catServer_->clients() : 0);
-    result += "\",\"error\":" + web::json(sharingError_);
+    result += ",\"running\":" + boolean(catServer_ && catServer_->running());
+    result += ",\"port\":" + web::json(std::to_string(sharePort_));
+    result += ",\"clients\":" + std::to_string(catServer_ ? catServer_->clients() : 0);
+    result += ",\"error\":" + web::json(sharingError_);
     result += "},\"audio\":{\"devices\":[";
 
     // Limit audio devices to prevent unbounded growth (MAX_AUDIO_DEVICE_IDS = 30)
@@ -495,40 +561,71 @@ std::string ControllerMac::buildStateJson() {
         std::string idStr(d.id.begin(), d.id.end());
         std::string nameStr(d.name.begin(), d.name.end());
         result += "{\"id\":" + web::json(idStr);
-        result += "\",\"name\":" + web::json(nameStr);
-        result += "\",\"input\":" + boolean(d.input);
-        result += "\",\"remote\":" + boolean(d.remote) + '}';
+        result += ",\"name\":" + web::json(nameStr);
+        result += ",\"input\":" + boolean(d.input);
+        result += ",\"remote\":" + boolean(d.remote) + '}';
     }
 
     if (result.size() > MAX_JSON_STRING_SIZE) {
         throw std::runtime_error("buildStateJson: Exceeded maximum JSON size after audio devices");
     }
 
+    // "maps" is an array of 4 device-id strings ("" = choose/default), matching
+    // web/app.js which compares a.maps[slot] against each device's id.
     result += "],\"maps\":[";
-    result += "{\"label\":\"Radio receive\",\"id\":\"default\",\"status\":" + web::json(receiveAudio_.status().active ? "Active" : "Off") + ",";
-    result += "{\"label\":\"Host listening\",\"id\":\"default\",\"status\":" + web::json(receiveAudio_.status().active ? "Active" : "Off") + ",";
-    result += "{\"label\":\"Host microphone\",\"id\":\"default\",\"status\":" + web::json(microphoneAudio_.status().active ? "Active" : "Off") + ",";
-    result += "{\"label\":\"Radio transmit\",\"id\":\"default\",\"status\":" + web::json(microphoneAudio_.status().active ? "Active" : "Off") + "}";
-    // Log before routes section
+    for (unsigned i = 0; i < 4; ++i) {
+        if (i) result += ',';
+        result += web::json(std::string(audioSelectedIds_[i].begin(), audioSelectedIds_[i].end()));
+    }
+    const auto rx = receiveAudio_.status();
+    const auto mic = microphoneAudio_.status();
+    const auto pttIndex = [](int seconds) {
+        static const int limits[] = {30, 60, 180, 300, 600};
+        for (int i = 0; i < 5; ++i) if (limits[i] == seconds) return i;
+        return 2;
+    }(pttLimitSeconds_);
+    result += "],\"receiveWanted\":" + boolean(receiveWanted_)
+        + ",\"microphoneWanted\":" + boolean(microphoneWanted_)
+        + ",\"receiveActive\":" + boolean(rx.active)
+        + ",\"microphoneActive\":" + boolean(mic.active)
+        + ",\"receiveText\":" + web::json(std::string(rx.text.begin(), rx.text.end()))
+        + ",\"microphoneText\":" + web::json(std::string(mic.text.begin(), mic.text.end()))
+        + ",\"inputPeak\":" + std::to_string(rx.inputPeak)
+        + ",\"outputPeak\":" + std::to_string(rx.outputPeak)
+        + ",\"micInputPeak\":" + std::to_string(mic.inputPeak)
+        + ",\"micOutputPeak\":" + std::to_string(mic.outputPeak)
+        + ",\"receiveLevel\":" + std::to_string(static_cast<int>(receiveGain_ * 100.0f))
+        + ",\"microphoneLevel\":" + std::to_string(static_cast<int>(micGain_ * 100.0f))
+        + ",\"pttLimit\":" + std::to_string(pttIndex)
+        + ",\"unattended\":" + boolean(unattended_)
+        + ",\"refreshing\":false"
+        + ",\"error\":\"\"";
+    // Log before routes section (debug output only)
+#ifdef BUILD_DEBUG
     std::cout << "[FT-710] [BUILD] Before routes section, RSS: " << get_memory_usage_kb() << " KB" << std::endl;
-    result += "],\"routes\":[";
+#endif
+    result += ",\"routes\":[";
     result += "{\"name\":\"receive\",\"active\":" + boolean(receiveAudio_.status().active);
     result += ",\"starting\":" + boolean(receiveAudio_.status().starting);
     result += ",\"status\":" + web::json(receiveAudio_.status().active ? "Running" : "Off");
     result += ",\"inputPeak\":" + std::to_string(receiveAudio_.status().inputPeak);
-    result += ",\"outputPeak\":" + std::to_string(receiveAudio_.status().outputPeak) + ",";
+    result += ",\"outputPeak\":" + std::to_string(receiveAudio_.status().outputPeak) + "},";
     result += "{\"name\":\"microphone\",\"active\":" + boolean(microphoneAudio_.status().active);
     result += ",\"starting\":" + boolean(microphoneAudio_.status().starting);
     result += ",\"status\":" + web::json(microphoneAudio_.status().active ? "Running" : "Off");
     result += ",\"inputPeak\":" + std::to_string(microphoneAudio_.status().inputPeak);
-    result += ",\"outputPeak\":" + std::to_string(microphoneAudio_.status().outputPeak);
+    result += ",\"outputPeak\":" + std::to_string(microphoneAudio_.status().outputPeak) + "}";
     result += "]},\"activity\":[";
 
-    // Log before activity section and lock acquisition
+    // Log before activity section and lock acquisition (debug output only)
+#ifdef BUILD_DEBUG
     std::cout << "[FT-710] [BUILD] Before activity section, RSS: " << get_memory_usage_kb() << " KB" << std::endl;
+#endif
 
     {
+#ifdef BUILD_DEBUG
         std::cout << "[FT-710] [BUILD] After logging, RSS: " << get_memory_usage_kb() << " KB" << std::endl;
+#endif
         std::lock_guard lock(activityMutex_);
         // Safety bounds - don't iterate beyond max activity entries
         constexpr size_t MAX_ACTIVITY_ENTRIES = 500;
@@ -563,24 +660,23 @@ std::string ControllerMac::buildStateJson() {
     // Bound rf status string to prevent unbounded memory allocation
     auto const& statusWS = rfCapture_.status();
     std::string rfStatus;
-    if (statusWS.size() > 100) {
-        // Convert wstring to string with size limit (~60 wide chars)
-        rfStatus.reserve(100);
+
+    // Convert wstring to UTF-8 string safely (wchar_t is UTF-16 on macOS)
+    if (!statusWS.empty()) {
+        rfStatus.reserve(std::min(statusWS.size() * 4, size_t(2048)));
         for (wchar_t wc : statusWS) {
-            if (rfStatus.size() >= 100) break;  // UTF-8 limit
-            char buf[8];  // Max UTF-8 chars for a wchar_t
-            wcstombs(buf, &wc, sizeof(buf));
-            rfStatus.append(buf);
+            char buf[8];  // Max UTF-8 chars for any Unicode character
+            int n = wcstombs(buf, &wc, sizeof(buf));
+            if (n <= 0) break;  // Invalid or error on this character
+            rfStatus.append(buf, n);
         }
-    } else {
-        rfStatus = std::string(statusWS.begin(), statusWS.end());
     }
     result += "],\"rf\":{\"running\":" + boolean(rfCapture_.running());
-    result += "\",\"status\":" + web::json(rfStatus);
-    result += "\",\"port\":" + rfCat2Port_ + "\";";
-    result += "\",\"baud\":" + std::to_string(rfCat2Baud_);
-    result += "\",\"span\":" + std::to_string(rfSpan_);
-    result += "\",\"level\":" + std::to_string(rfWaterfallLevelDb_) + "}}";
+    result += ",\"status\":" + web::json(rfStatus);
+    result += ",\"port\":" + web::json(rfCat2Port_);
+    result += ",\"baud\":" + std::to_string(rfCat2Baud_);
+    result += ",\"span\":" + std::to_string(rfSpan_);
+    result += ",\"level\":" + std::to_string(rfWaterfallLevelDb_) + "}}";
 
     // Final size check before return
     if (result.size() > MAX_JSON_STRING_SIZE) {
@@ -598,11 +694,17 @@ void ControllerMac::run() {
             publishWeb();
         } catch (const std::bad_alloc&) {
             // Must check bad_alloc BEFORE std::exception since it inherits from exception
+#ifdef BUILD_DEBUG
             std::cout << "[FT-710] [RUN] CRITICAL: Memory allocation failed in publishWeb()!" << std::endl;
+#endif
         } catch (const std::exception& e) {
+#ifdef BUILD_DEBUG
             std::cout << "[FT-710] [RUN] Error in publishWeb(): " << e.what() << std::endl;
+#endif
         } catch (...) {
+#ifdef BUILD_DEBUG
             std::cout << "[FT-710] [RUN] Unknown exception in publishWeb()!" << std::endl;
+#endif
         }
     }
 }

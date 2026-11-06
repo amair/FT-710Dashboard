@@ -105,7 +105,10 @@ Credentials::~Credentials() {
     if (root_) CertFreeCertificateContext(root_);
 }
 void Credentials::create(const std::wstring& folder) {
+    std::cout << "DEBUG: Entering Credentials::create" << std::endl;
     auto addresses = hostAddresses();
+    HCRYPTPROV provider = 0; HCRYPTKEY key = 0;
+
     HCRYPTPROV provider = 0; HCRYPTKEY key = 0;
     const wchar_t* container = L"M0NXD.FT710Dashboard.WebTLS.v1";
     const wchar_t* providerName = MS_ENH_RSA_AES_PROV_W;

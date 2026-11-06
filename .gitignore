@@ -1,6 +1,6 @@
 /build/
 /build-mac/
-macos-yy3big/
+/dist/
 /vendor/
 *.user
 *.log
@@ -18,9 +18,3 @@ macos-yy3big/
 
 # FTDI runtime binaries are downloaded separately and must not be committed
 /runtime/ftdi/*.dll
-
-# MacOS
-.DS_Store
-
-# Build 
-.vscode

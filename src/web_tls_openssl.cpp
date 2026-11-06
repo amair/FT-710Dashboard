@@ -159,10 +159,20 @@ void Credentials::create(const std::wstring& folderW) {
         FILE* fpKey = fopen(keyPath.string().c_str(), "rb");
         if (fpCert && fpKey) {
             x509 = PEM_read_X509(fpCert, nullptr, nullptr, nullptr);
+            if (x509) {
+                char buf[256]{};
+                BIO* bio = BIO_new_mem_buf(buf, sizeof(buf));
+                X509_NAME_print_ex(bio, X509_get_subject_name(x509), 0, 0);
+                std::cout << "Loaded Certificate Subject: " << buf << std::endl;
+                BIO_free(bio);
+            }
             pkey = PEM_read_PrivateKey(fpKey, nullptr, nullptr, nullptr);
             fclose(fpCert);
             fclose(fpKey);
             if (x509 && pkey) loaded = true;
+
+
+
         }
         if (!loaded) {
             if (x509) { X509_free(x509); x509 = nullptr; }

@@ -14,10 +14,6 @@ std::wstring toWide(const char* utf8) {
     return std::wstring(s.begin(), s.end());
 }
 
-std::string toUtf8(const std::wstring& w) {
-    return std::string(w.begin(), w.end());
-}
-
 int parsePaIndex(const std::wstring& id) {
     if (id.starts_with(L"pa:")) {
         try {
@@ -26,7 +22,53 @@ int parsePaIndex(const std::wstring& id) {
     }
     return paNoDevice;
 }
+
+#ifdef BUILD_DEBUG
+std::string toNarrow(const std::wstring& w) {
+    std::string out;
+    for (wchar_t c : w) out += static_cast<char>(c);
+    return out;
 }
+#endif
+
+}  // end anonymous namespace
+
+// Search for FT-710 USB Audio CODEC device in the available devices
+// Returns device ID if found, empty string otherwise (macOS only)
+#if !defined(_WIN32)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+std::wstring findFT710AudioDevice(const std::vector<Device>& devices, bool isInput) {
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][AUDIO] Searching for FT-710 USB Audio CODEC (input=" << isInput << ")" << std::endl;
+#endif
+
+    for (const auto& dev : devices) {
+        if (dev.input == isInput) {
+            std::string devName(dev.name.begin(), dev.name.end());
+            std::string idStr(dev.id.begin(), dev.id.end());
+#ifdef BUILD_DEBUG
+            std::cout << "[FT-710][AUDIO] Found: " << devName << " (id=" << idStr << ")" << std::endl;
+#endif
+            if (devName.find("USB Audio CODEC") != std::string::npos ||
+                devName.find("FT-710") != std::string::npos) {
+#ifdef BUILD_DEBUG
+                std::cout << "[FT-710][AUDIO] MATCH FOUND: " << devName << std::endl;
+#endif
+                return std::wstring(dev.id.begin(), dev.id.end());
+            }
+        }
+    }
+
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][AUDIO] Not found, will use defaults" << std::endl;
+#endif
+    return L"";
+}
+
+#pragma GCC diagnostic pop
+
+#endif  // _WIN32
 
 bool remoteSession() {
     return false;
@@ -76,6 +118,9 @@ std::vector<Device> devices() {
     return list;
 }
 
+}  // end anonymous namespace
+
+namespace audio {
 Route::Route() {
     gain_ = 1.0f;
 }
@@ -103,14 +148,28 @@ void Route::requestStop() {
 }
 
 void Route::stop() {
+    std::lock_guard lock(startStopMutex_);
+    stopLocked();
+}
+
+void Route::stopLocked() {
     requestStop();
-    if (thread_.joinable()) {
-        thread_.join();
-    }
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][ROUTE] stop(): joinable=" << thread_.joinable() << std::endl;
+#endif
+    if (thread_.joinable()) thread_.join();
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][ROUTE] stop(): done" << std::endl;
+#endif
 }
 
 void Route::start(const std::wstring& source, const std::wstring& destination) {
-    stop();
+    std::lock_guard lock(startStopMutex_);
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][ROUTE] start('" << toNarrow(source) << "','" << toNarrow(destination)
+              << "'): joinable before stop=" << thread_.joinable() << std::endl;
+#endif
+    stopLocked();
     stopWanted_.store(false);
     {
         std::lock_guard lock(mutex_);
@@ -118,29 +177,49 @@ void Route::start(const std::wstring& source, const std::wstring& destination) {
         status_.active = false;
         status_.text = L"Starting...";
     }
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][ROUTE] start(): creating thread" << std::endl;
+#endif
     thread_ = std::thread([this, source, destination] {
         run(source, destination);
     });
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][ROUTE] start(): thread created" << std::endl;
+#endif
 }
 
 void Route::run(std::wstring source, std::wstring destination) {
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][ROUTE] run(): entered" << std::endl;
+#endif
     if (Pa_Initialize() != paNoError) {
         std::lock_guard lock(mutex_);
         status_ = {false, false, 0, 0, L"PortAudio initialization failed"};
         return;
     }
 
-    int inDev = parsePaIndex(source);
-    int outDev = parsePaIndex(destination);
-
-    if (inDev == paNoDevice && !source.empty()) inDev = Pa_GetDefaultInputDevice();
-    if (outDev == paNoDevice && !destination.empty()) outDev = Pa_GetDefaultOutputDevice();
+    // An empty id means "use the system default device". A "browser:" id means
+    // the browser owns that endpoint, so parsePaIndex() returns paNoDevice and
+    // no host device is opened for it.
+    int inDev = source.empty() ? Pa_GetDefaultInputDevice() : parsePaIndex(source);
+    int outDev = destination.empty() ? Pa_GetDefaultOutputDevice() : parsePaIndex(destination);
+#ifdef BUILD_DEBUG
+    std::cout << "[FT-710][ROUTE] run(): inDev=" << inDev << " outDev=" << outDev << std::endl;
+#endif
 
     PaStreamParameters inParams{};
     PaStreamParameters outParams{};
 
     bool hasIn = (inDev != paNoDevice);
     bool hasOut = (outDev != paNoDevice);
+    if (!hasIn && !hasOut) {
+#ifdef BUILD_DEBUG
+        std::cout << "[FT-710][ROUTE] run(): no endpoints, returning" << std::endl;
+#endif
+        std::lock_guard lock(mutex_);
+        status_ = {false, false, 0, 0, L"No audio endpoint is available; select a source and destination device."};
+        return;
+    }
 
     if (hasIn) {
         inParams.device = inDev;
@@ -217,6 +296,11 @@ void Route::run(std::wstring source, std::wstring destination) {
                     if (receiveTap_) {
                         spectrum_.push(s);
                         browserAudio().receive(s);
+                    }
+
+                    {
+                        std::lock_guard tap_lock(taps_mutex_);
+                        for (auto& tap : taps_) tap->push_sample(s);
                     }
 
                     outBuffer[i] = s * curGain;
